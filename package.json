@@ -1,0 +1,12 @@
+{
+  "name": "gt06-relay-server",
+  "version": "1.0.0",
+  "description": "Translates raw GT06 GPS tracker signals into Base44 webhook calls",
+  "main": "gt06_relay_server.js",
+  "scripts": {
+    "start": "node gt06_relay_server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
