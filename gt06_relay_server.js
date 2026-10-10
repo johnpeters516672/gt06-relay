@@ -74,8 +74,17 @@ function decodePacket(packet) {
     case PROTOCOL.GPS_LOCATION:
     case PROTOCOL.GPS_LBS_STATUS:
       return { ...decodeGpsPacket(data), serialNumber };
-    case PROTOCOL.HEARTBEAT:
-      return { type: 'heartbeat', serialNumber };
+    case PROTOCOL.HEARTBEAT: {
+      // data = [terminal info 1][battery 1][GSM signal 1][ext voltage/mode 1][language 1]
+      // Wireless trackers (W18L-E etc.) report battery as a percentage in byte 2.
+      return {
+        type: 'heartbeat',
+        serialNumber,
+        battery: data.length > 1 ? Math.min(data[1], 100) : null,
+        signal: data.length > 2 ? data[2] : null,
+        charging: data.length > 0 ? (data[0] & 0x04) !== 0 : null,
+      };
+    }
     case PROTOCOL.LBS_ONLY:
       // Cell-tower-only report (no GPS fix, usually indoors). Not forwarded.
       return { type: 'lbs', serialNumber };
@@ -205,6 +214,25 @@ function handleCommandReply(imei, decoded) {
   }
 }
 
+// ---------- Battery / signal status (from heartbeat packets) ----------
+// Heartbeats arrive every few minutes; tell Base44 at most every 15 minutes
+// per tracker, or sooner if the battery percentage changed by 5 or more.
+const lastStatusSent = new Map(); // imei -> { at, battery }
+const STATUS_MIN_MS = Number(process.env.STATUS_MIN_MS || 15 * 60 * 1000);
+async function maybeReportStatus(imei, hb) {
+  if (!imei || hb.battery == null) return;
+  const prev = lastStatusSent.get(imei);
+  const now = Date.now();
+  if (prev && now - prev.at < STATUS_MIN_MS && Math.abs(hb.battery - prev.battery) < 5) return;
+  lastStatusSent.set(imei, { at: now, battery: hb.battery });
+  console.log(`[relay] status imei=${imei} battery=${hb.battery}% signal=${hb.signal} charging=${hb.charging}`);
+  try {
+    await callCommandsApi({ action: 'status', imei, battery: hb.battery, signal: hb.signal, charging: hb.charging });
+  } catch (err) {
+    console.error('[relay] could not report status:', err.message);
+  }
+}
+
 // ---------- Forward a decoded event to Base44 ----------
 async function forwardToBase44(imei, decoded) {
   const payload = {
@@ -280,6 +308,7 @@ function startRelay() {
 
           if (decoded.type === 'heartbeat') {
             socket.write(buildAck(PROTOCOL.HEARTBEAT, decoded.serialNumber));
+            maybeReportStatus(imei, decoded);
             continue;
           }
 
