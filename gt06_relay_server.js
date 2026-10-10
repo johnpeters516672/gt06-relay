@@ -53,7 +53,7 @@ function extractPackets(buffer) {
   return { packets, remainder: buffer.slice(offset) };
 }
 
-const PROTOCOL = { LOGIN: 0x01, GPS_LOCATION: 0x12, GPS_LBS_STATUS: 0x22, HEARTBEAT: 0x13, ALARM: 0x16 };
+const PROTOCOL = { LOGIN: 0x01, GPS_LOCATION: 0x12, GPS_LBS_STATUS: 0x22, HEARTBEAT: 0x13, ALARM: 0x16, LBS_ONLY: 0x18 };
 
 function decodePacket(packet) {
   const length = packet[2];
@@ -63,12 +63,18 @@ function decodePacket(packet) {
 
   switch (protocolNumber) {
     case PROTOCOL.LOGIN:
-      return { type: 'login', imei: data.slice(0, 8).toString('hex'), serialNumber };
+      // The login packet carries the IMEI as 16 BCD digits, so a 15-digit IMEI
+      // arrives with a leading 0 (e.g. 0351840620502686). Strip it so it matches
+      // the real IMEI printed on the device.
+      return { type: 'login', imei: data.slice(0, 8).toString('hex').replace(/^0/, ''), serialNumber };
     case PROTOCOL.GPS_LOCATION:
     case PROTOCOL.GPS_LBS_STATUS:
       return { ...decodeGpsPacket(data), serialNumber };
     case PROTOCOL.HEARTBEAT:
       return { type: 'heartbeat', serialNumber };
+    case PROTOCOL.LBS_ONLY:
+      // Cell-tower-only report (no GPS fix, usually indoors). Not forwarded.
+      return { type: 'lbs', serialNumber };
     case PROTOCOL.ALARM:
       return { ...decodeGpsPacket(data), type: 'alarm', alarmType: data[data.length - 3], serialNumber };
     default:
@@ -179,6 +185,11 @@ function startRelay() {
 
           if (decoded.type === 'heartbeat') {
             socket.write(buildAck(PROTOCOL.HEARTBEAT, decoded.serialNumber));
+            continue;
+          }
+
+          if (decoded.type === 'lbs') {
+            console.log(`[relay] tower-only report (no GPS fix) imei=${imei || 'unknown'} - waiting for a GPS fix`);
             continue;
           }
 
