@@ -21,6 +21,10 @@ const net = require('net');
 const BASE44_WEBHOOK_URL = process.env.BASE44_WEBHOOK_URL || 'https://REPLACE-ME.base44.app/api/functions/ingestGpsPing';
 const RELAY_SECRET = process.env.RELAY_SECRET || 'REPLACE-WITH-A-LONG-RANDOM-STRING';
 const PORT = process.env.PORT || 5023;
+// Where the relay asks Base44 for queued device commands (reporting mode, etc.).
+// Defaults to the same function URL used for pings, with the name swapped.
+const BASE44_COMMANDS_URL = process.env.BASE44_COMMANDS_URL || BASE44_WEBHOOK_URL.replace(/ingestGpsPing$/, 'deviceCommands');
+const COMMAND_POLL_MS = Number(process.env.COMMAND_POLL_MS || 60000);
 // ============================================================
 
 // ---------- CRC-16/X-25 (validates every GT06 packet) ----------
@@ -53,7 +57,7 @@ function extractPackets(buffer) {
   return { packets, remainder: buffer.slice(offset) };
 }
 
-const PROTOCOL = { LOGIN: 0x01, GPS_LOCATION: 0x12, GPS_LBS_STATUS: 0x22, HEARTBEAT: 0x13, ALARM: 0x16, LBS_ONLY: 0x18 };
+const PROTOCOL = { LOGIN: 0x01, GPS_LOCATION: 0x12, GPS_LBS_STATUS: 0x22, HEARTBEAT: 0x13, ALARM: 0x16, LBS_ONLY: 0x18, COMMAND: 0x80, COMMAND_REPLY: 0x15 };
 
 function decodePacket(packet) {
   const length = packet[2];
@@ -75,6 +79,13 @@ function decodePacket(packet) {
     case PROTOCOL.LBS_ONLY:
       // Cell-tower-only report (no GPS fix, usually indoors). Not forwarded.
       return { type: 'lbs', serialNumber };
+    case PROTOCOL.COMMAND_REPLY: {
+      // data = [cmdLen 1][server flag 4][content N][language 2]
+      const cmdLen = data[0];
+      const flag = data.readUInt32BE(1);
+      const text = data.slice(5, 1 + cmdLen).toString('ascii');
+      return { type: 'command_reply', flag, text, serialNumber };
+    }
     case PROTOCOL.ALARM:
       return { ...decodeGpsPacket(data), type: 'alarm', alarmType: data[data.length - 3], serialNumber };
     default:
@@ -111,6 +122,87 @@ function buildAck(protocolNumber, serialNumber) {
   const crc = crc16X25(withLength);
   const crcBuf = Buffer.from([(crc >> 8) & 0xff, crc & 0xff]);
   return Buffer.concat([Buffer.from([0x78, 0x78]), withLength, crcBuf, Buffer.from([0x0d, 0x0a])]);
+}
+
+// ---------- Server -> tracker commands (protocol 0x80) ----------
+// Same text commands as SMS (e.g. "STATIC,240#"), sent over the tracker's live
+// connection - this is how WhatsGPS delivers its commands.
+let commandSerial = 1;
+function buildCommand(flag, text) {
+  const content = Buffer.from(text, 'ascii');
+  const flagBuf = Buffer.alloc(4);
+  flagBuf.writeUInt32BE(flag >>> 0);
+  const serial = Buffer.alloc(2);
+  serial.writeUInt16BE(commandSerial++ & 0xffff);
+  // length byte = protocol(1) + cmdLen(1) + flag(4) + content(N) + serial(2) + crc(2)
+  const body = Buffer.concat([Buffer.from([PROTOCOL.COMMAND, 4 + content.length]), flagBuf, content, serial]);
+  const withLength = Buffer.concat([Buffer.from([body.length + 2]), body]);
+  const crc = crc16X25(withLength);
+  return Buffer.concat([
+    Buffer.from([0x78, 0x78]), withLength,
+    Buffer.from([(crc >> 8) & 0xff, crc & 0xff]), Buffer.from([0x0d, 0x0a]),
+  ]);
+}
+
+const imeiSockets = new Map();   // imei -> live socket
+const inFlight = new Map();      // flag -> { id, imei, remaining, replies: [] }
+let nextFlag = 1;
+
+async function callCommandsApi(body) {
+  const res = await fetch(BASE44_COMMANDS_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${RELAY_SECRET}` },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
+  return res.json();
+}
+
+async function reportCommand(update) {
+  try { await callCommandsApi({ action: 'report', ...update }); }
+  catch (err) { console.error('[relay] could not report command status:', err.message); }
+}
+
+// Ask Base44 for queued commands and push the ones whose tracker is connected.
+async function pushPendingCommands(onlyImei) {
+  const imeis = onlyImei ? [onlyImei] : [...imeiSockets.keys()];
+  if (imeis.length === 0) return;
+  let list;
+  try {
+    const out = await callCommandsApi({ action: 'list', imeis });
+    list = out.commands || [];
+  } catch (err) {
+    console.error('[relay] could not fetch commands:', err.message);
+    return;
+  }
+  for (const cmd of list) {
+    const socket = imeiSockets.get(cmd.imei);
+    if (!socket || socket.destroyed) continue;
+    const lines = String(cmd.text).split('\n').map((l) => l.trim()).filter(Boolean);
+    const flag = nextFlag++;
+    inFlight.set(flag, { id: cmd.id, imei: cmd.imei, remaining: lines.length, replies: [] });
+    for (const line of lines) {
+      socket.write(buildCommand(flag, line));
+      console.log(`[relay] sent command to imei=${cmd.imei}: ${line}`);
+    }
+    await reportCommand({ id: cmd.id, imei: cmd.imei, status: 'sent' });
+  }
+}
+
+function handleCommandReply(imei, decoded) {
+  console.log(`[relay] tracker reply imei=${imei || 'unknown'}: ${decoded.text}`);
+  const entry = inFlight.get(decoded.flag);
+  if (!entry) {
+    // Relay restarted since sending, or reply to an SMS-style command: let Base44 match by IMEI.
+    reportCommand({ imei, status: 'confirmed', reply: decoded.text });
+    return;
+  }
+  entry.replies.push(decoded.text);
+  entry.remaining -= 1;
+  if (entry.remaining <= 0) {
+    inFlight.delete(decoded.flag);
+    reportCommand({ id: entry.id, imei: entry.imei, status: 'confirmed', reply: entry.replies.join(' | ') });
+  }
 }
 
 // ---------- Forward a decoded event to Base44 ----------
@@ -167,8 +259,11 @@ function startRelay() {
 
           if (decoded.type === 'login') {
             socketImeiMap.set(socket, decoded.imei);
+            imeiSockets.set(decoded.imei, socket);
             console.log(`[relay] login imei=${decoded.imei} from ${remoteId}`);
             socket.write(buildAck(PROTOCOL.LOGIN, decoded.serialNumber));
+            // Deliver anything queued for this tracker as soon as it connects.
+            setTimeout(() => pushPendingCommands(decoded.imei), 2000);
             continue;
           }
 
@@ -188,6 +283,11 @@ function startRelay() {
             continue;
           }
 
+          if (decoded.type === 'command_reply') {
+            handleCommandReply(imei, decoded);
+            continue;
+          }
+
           if (decoded.type === 'lbs') {
             console.log(`[relay] tower-only report (no GPS fix) imei=${imei || 'unknown'} - waiting for a GPS fix`);
             continue;
@@ -201,12 +301,17 @@ function startRelay() {
     });
 
     socket.on('close', () => {
+      const closedImei = socketImeiMap.get(socket);
+      if (closedImei && imeiSockets.get(closedImei) === socket) imeiSockets.delete(closedImei);
       socketImeiMap.delete(socket);
       console.log(`[relay] connection closed: ${remoteId}`);
     });
 
     socket.on('error', (err) => console.error(`[relay] socket error ${remoteId}:`, err.message));
   });
+
+  // Only polls while at least one tracker is connected.
+  setInterval(() => pushPendingCommands(), COMMAND_POLL_MS);
 
   server.listen(PORT, () => console.log(`[relay] listening on port ${PORT}, forwarding to ${BASE44_WEBHOOK_URL}`));
   return server;
