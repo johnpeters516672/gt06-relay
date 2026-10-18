@@ -57,7 +57,11 @@ function extractPackets(buffer) {
   return { packets, remainder: buffer.slice(offset) };
 }
 
-const PROTOCOL = { LOGIN: 0x01, GPS_LOCATION: 0x12, GPS_LBS_STATUS: 0x22, HEARTBEAT: 0x13, ALARM: 0x16, LBS_ONLY: 0x18, COMMAND: 0x80, COMMAND_REPLY: 0x15 };
+// 0xA0 / 0xA3 are the 4G variant of GT06: 0xA0 = GPS position (same field layout as
+// 0x22 but with longer cell-tower info after it), 0xA3 = the periodic status/heartbeat
+// packet. If the server does not answer 0xA3, the tracker drops the connection after
+// three tries and logs in again (seen every ~7 minutes on IMEI 357956373407958).
+const PROTOCOL = { LOGIN: 0x01, GPS_LOCATION: 0x12, GPS_LBS_STATUS: 0x22, HEARTBEAT: 0x13, ALARM: 0x16, LBS_ONLY: 0x18, COMMAND: 0x80, COMMAND_REPLY: 0x15, GPS_4G: 0xa0, HEARTBEAT_4G: 0xa3 };
 
 function decodePacket(packet) {
   const length = packet[2];
@@ -74,6 +78,20 @@ function decodePacket(packet) {
     case PROTOCOL.GPS_LOCATION:
     case PROTOCOL.GPS_LBS_STATUS:
       return { ...decodeGpsPacket(data), serialNumber };
+    case PROTOCOL.GPS_4G:
+      // Same first 18 bytes as 0x22 (time, satellites, lat, lon, speed, course/status).
+      // This tracker leaves the "GPS fixed" status bit at 0 even when it reports 12 satellites and
+      // coordinates that match a second tracker sitting next to it (seen 2026-10-18), so for 4G
+      // packets also trust the satellite count in the low nibble of byte 6.
+      {
+        const g = decodeGpsPacket(data);
+        const sats = data[6] & 0x0f;
+        const plausible = Math.abs(g.latitude) > 0.01 && Math.abs(g.longitude) > 0.01;
+        return { ...g, satellites: sats, gpsFixed: g.gpsFixed || (sats >= 4 && plausible), serialNumber, via4g: true };
+      }
+    case PROTOCOL.HEARTBEAT_4G:
+      // Payload meaning is not documented for this tracker yet; we only need to answer it.
+      return { type: 'heartbeat4g', serialNumber, raw: data.toString('hex') };
     case PROTOCOL.HEARTBEAT: {
       // data = [terminal info 1][battery 1][GSM signal 1][ext voltage/mode 1][language 1]
       // Wireless trackers (W18L-E etc.) report battery as a percentage in byte 2.
@@ -298,11 +316,24 @@ function startRelay() {
           const imei = socketImeiMap.get(socket);
 
           if (decoded.type === 'gps' || decoded.type === 'alarm') {
-            const ackProtocol = decoded.type === 'alarm' ? PROTOCOL.ALARM : PROTOCOL.GPS_LOCATION;
-            socket.write(buildAck(ackProtocol, decoded.serialNumber));
+            // 4G position packets: do not send the old 0x12 ack back. Only log, forward, move on.
+            if (!decoded.via4g) {
+              const ackProtocol = decoded.type === 'alarm' ? PROTOCOL.ALARM : PROTOCOL.GPS_LOCATION;
+              socket.write(buildAck(ackProtocol, decoded.serialNumber));
+            }
+            if (decoded.via4g) {
+              console.log(`[relay] 4G position imei=${imei || 'unknown'} fixed=${decoded.gpsFixed} sats=${decoded.satellites} lat=${decoded.latitude.toFixed(5)} lon=${decoded.longitude.toFixed(5)} speed=${decoded.speed}`);
+            }
             if (imei && decoded.gpsFixed) {
               forwardToBase44(imei, decoded);
             }
+            continue;
+          }
+
+          if (decoded.type === 'heartbeat4g') {
+            // Answer with the same protocol number and serial, same frame as the other acks.
+            socket.write(buildAck(PROTOCOL.HEARTBEAT_4G, decoded.serialNumber));
+            console.log(`[relay] 4G heartbeat imei=${imei || 'unknown'} payload=${decoded.raw}`);
             continue;
           }
 
